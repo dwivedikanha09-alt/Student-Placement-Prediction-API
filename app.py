@@ -5,6 +5,10 @@ from pydantic import BaseModel
 
 app = FastAPI()
 
+@app.get("/health")
+def health():
+    return {"status": "ok"}
+
 model   = joblib.load("placement_model.joblib")
 columns = joblib.load("columns.joblib")
 
