@@ -7,17 +7,34 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
-app = FastAPI(title="Student Placement Prediction API")
+# --------------------------------------------------
+# Application setup
+# --------------------------------------------------
 
-# Get project directory
+app = FastAPI(
+    title="Student Placement Prediction API",
+    description="Predict student placement using a trained Decision Tree model.",
+    version="1.0.0"
+)
+
 BASE_DIR = Path(__file__).resolve().parent
 
-# Load trained model and feature columns
-model = joblib.load(BASE_DIR / "placement_model.joblib")
-columns = joblib.load(BASE_DIR / "columns.joblib")
+# --------------------------------------------------
+# Load model and training feature columns
+# --------------------------------------------------
 
-# Normalize feature names while preserving the model's expected names
-columns = list(columns)
+try:
+    model = joblib.load(BASE_DIR / "placement_model.joblib")
+    columns = joblib.load(BASE_DIR / "columns.joblib")
+    columns = list(columns)
+
+except Exception as e:
+    raise RuntimeError(f"Failed to load model or columns: {e}")
+
+
+# --------------------------------------------------
+# Input schema
+# --------------------------------------------------
 
 class StudentInput(BaseModel):
     gender: str
@@ -32,88 +49,102 @@ class StudentInput(BaseModel):
     branch: str
 
 
+# --------------------------------------------------
+# Home route
+# --------------------------------------------------
+
 @app.get("/")
 def home():
     index_file = BASE_DIR / "templates" / "index.html"
 
     if not index_file.exists():
-        raise HTTPException(
-            status_code=404,
-            detail="templates/index.html not found"
-        )
+        return {
+            "message": "Student Placement Prediction API is running",
+            "docs": "/docs",
+            "health": "/health"
+        }
 
     return FileResponse(index_file)
 
+
+# --------------------------------------------------
+# Health check
+# --------------------------------------------------
 
 @app.get("/health")
 def health():
     return {"status": "ok"}
 
 
+# --------------------------------------------------
+# Prediction route
+# --------------------------------------------------
+
 @app.post("/predict")
 def predict(data: StudentInput):
 
     try:
-        # Encode categorical values
-        gender_value = (
-            1 if data.gender.strip().lower() in ["male", "m"]
+        # Encode categorical inputs
+        gender = (
+            1
+            if data.gender.strip().lower() in ["male", "m"]
             else 0
         )
 
-        extra_value = (
-            1 if data.extracurricular.strip().lower() == "yes"
+        extracurricular = (
+            1
+            if data.extracurricular.strip().lower() == "yes"
             else 0
         )
 
-        branch_value = data.branch.strip().upper()
+        branch = data.branch.strip().upper()
 
-        # Create input features
+        # Build the original input features
         row = {
-            "gender": gender_value,
+            "gender": gender,
             "study_hours": data.study_hours,
             "attendance": data.attendance,
             "sleep_hours": data.sleep_hours,
             "internet_usage": data.internet_usage,
             "assignments_completed": data.assignments_completed,
             "previous_score": data.previous_score,
-            "extracurricular": extra_value,
+            "extracurricular": extracurricular,
             "exam_score": data.exam_score,
         }
 
-        # Handle branch columns, including spaces in their names
+        # Identify branch columns while ignoring extra spaces
         branch_columns = [
             col for col in columns
             if str(col).strip().lower().startswith("branch_")
         ]
 
-        matched_branch = False
+        # Set one-hot encoded branch values
+        available_branches = []
 
         for col in branch_columns:
-            # Remove spaces around the feature name and category
-            category = str(col).strip()[len("branch_"):].strip().upper()
+            category = (
+                str(col).strip()[len("branch_"):]
+                .strip().upper()
+            )
 
-            value = 1 if category == branch_value else 0
-            row[col] = value
+            available_branches.append(category)
+            row[col] = 1 if category == branch else 0
 
-            if value == 1:
-                matched_branch = True
-
-        if branch_columns and not matched_branch:
-            valid_branches = [
-                str(col).strip()[len("branch_"):].strip()
-                for col in branch_columns
-            ]
-
+        # Reject unknown branches rather than silently
+        # predicting with an all-zero branch encoding
+        if branch_columns and branch not in available_branches:
             raise HTTPException(
                 status_code=422,
                 detail={
-                    "message": "Unknown branch. Check the branch value.",
+                    "message": "Unknown branch",
                     "provided_branch": data.branch,
-                    "valid_branches": valid_branches
+                    "available_branches": sorted(
+                        set(available_branches)
+                    )
                 }
             )
 
-        # Create DataFrame using the EXACT original model columns
+        # Create DataFrame and preserve EXACT training names
         df_row = pd.DataFrame([row])
 
         df_row = df_row.reindex(
@@ -121,11 +152,37 @@ def predict(data: StudentInput):
             fill_value=0
         )
 
-        # Predict placement
-        pred = model.predict(df_row)[0]
+        # Critical: keep the original model feature names.
+        # Never strip or rename the trained model's columns.
+        if hasattr(model, "feature_names_in_"):
+            expected_features = list(model.feature_names_in_)
 
+            # Verify the saved columns and model agree
+            if columns != expected_features:
+                raise HTTPException(
+                    status_code=500,
+                    detail=(
+                        "columns.joblib does not match the "
+                        "feature names stored in the model. "
+                        "Regenerate columns.joblib from the "
+                        "original training DataFrame."
+                    )
+                )
+
+            df_row = df_row.reindex(
+                columns=expected_features,
+                fill_value=0
+            )
+
+        # Predict
+        prediction = model.predict(df_row)[0]
+
+        # Return prediction
         return {
-            "prediction": "Placed" if int(pred) == 1 else "Not Placed"
+            "prediction": (
+                "Placed" if int(prediction) == 1
+                else "Not Placed"
+            )
         }
 
     except HTTPException:
