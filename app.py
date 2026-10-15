@@ -1,195 +1,121 @@
-
-import joblib
-import pandas as pd
-
-from pathlib import Path
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import FileResponse
 from pydantic import BaseModel
+import pandas as pd
+import joblib
+from pathlib import Path
 
-# --------------------------------------------------
-# Application setup
-# --------------------------------------------------
+app = FastAPI(title="Student Placement Prediction API")
 
-app = FastAPI(
-    title="Student Placement Prediction API",
-    description="Predict student placement using a trained Decision Tree model.",
-    version="1.0.0"
-)
-
+# Model aur columns wali files ka path
 BASE_DIR = Path(__file__).resolve().parent
 
-# --------------------------------------------------
-# Load model and training feature columns
-# --------------------------------------------------
+MODEL_PATH = BASE_DIR / "placement_model.joblib"
+COLUMNS_PATH = BASE_DIR / "columns.joblib"
 
-try:
-    model = joblib.load(BASE_DIR / "placement_model.joblib")
-    columns = joblib.load(BASE_DIR / "columns.joblib")
-    columns = list(columns)
+# Model load karna
+model = joblib.load(MODEL_PATH)
+saved_columns = joblib.load(COLUMNS_PATH)
 
-except Exception as e:
-    raise RuntimeError(f"Failed to load model or columns: {e}")
+# Model ke original feature names ko priority dena
+if hasattr(model, "feature_names_in_"):
+    columns = list(model.feature_names_in_)
+else:
+    columns = list(saved_columns)
+
+print("App directory:", BASE_DIR)
+print("Model path:", MODEL_PATH)
+print("Columns path:", COLUMNS_PATH)
+print("Total features:", len(columns))
 
 
-# --------------------------------------------------
-# Input schema
-# --------------------------------------------------
-
+# Input data ka structure
 class StudentInput(BaseModel):
     gender: str
     study_hours: float
     attendance: float
     sleep_hours: float
     internet_usage: float
-    assignments_completed: float
+    assignments_completed: int
     previous_score: float
     extracurricular: str
     exam_score: float
     branch: str
 
 
-# --------------------------------------------------
-# Home route
-# --------------------------------------------------
-
 @app.get("/")
 def home():
-    index_file = BASE_DIR / "templates" / "index.html"
+    return {
+        "message": "Student Placement Prediction API is running"
+    }
 
-    if not index_file.exists():
-        return {
-            "message": "Student Placement Prediction API is running",
-            "docs": "/docs",
-            "health": "/health"
-        }
-
-    return FileResponse(index_file)
-
-
-# --------------------------------------------------
-# Health check
-# --------------------------------------------------
-
-@app.get("/health")
-def health():
-    return {"status": "ok"}
-
-
-# --------------------------------------------------
-# Prediction route
-# --------------------------------------------------
 
 @app.post("/predict")
-def predict(data: StudentInput):
-
+def predict_placement(data: StudentInput):
     try:
-        # Encode categorical inputs
-        gender = (
-            1
-            if data.gender.strip().lower() in ["male", "m"]
-            else 0
-        )
-
-        extracurricular = (
-            1
-            if data.extracurricular.strip().lower() == "yes"
-            else 0
-        )
-
-        branch = data.branch.strip().upper()
-
-        # Build the original input features
-        row = {
-            "gender": gender,
+        # Numerical aur categorical input features
+        input_data = {
+            "gender": (
+                1 if data.gender.strip().lower() in ["male", "m"]
+                else 0
+            ),
             "study_hours": data.study_hours,
             "attendance": data.attendance,
             "sleep_hours": data.sleep_hours,
             "internet_usage": data.internet_usage,
             "assignments_completed": data.assignments_completed,
             "previous_score": data.previous_score,
-            "extracurricular": extracurricular,
+            "extracurricular": (
+                1 if data.extracurricular.strip().lower() == "yes"
+                else 0
+            ),
             "exam_score": data.exam_score,
         }
 
-        # Identify branch columns while ignoring extra spaces
+        # Sabhi model features ko zero se initialize karna
+        row = {column: 0 for column in columns}
+
+        # Numerical features set karna
+        for feature, value in input_data.items():
+            if feature in row:
+                row[feature] = value
+
+        # Branch category handle karna
+        branch = data.branch.strip().lower()
+
         branch_columns = [
-            col for col in columns
-            if str(col).strip().lower().startswith("branch_")
+            column for column in columns
+            if column.lower().startswith("branch_")
         ]
 
-        # Set one-hot encoded branch values
-        available_branches = []
+        matching_columns = [
+            column for column in branch_columns
+            if column.split("_", 1)[1].strip().lower() == branch
+        ]
 
-        for col in branch_columns:
-            category = (
-                str(col).strip()[len("branch_"):]
-                .strip().upper()
-            )
+        if matching_columns:
+            # Sirf ek matching branch feature ko 1 karna
+            row[matching_columns[0]] = 1
 
-            available_branches.append(category)
-            row[col] = 1 if category == branch else 0
+        # Model ke exact feature order mein DataFrame banana
+        input_df = pd.DataFrame([row])
+        input_df = input_df.reindex(columns=columns, fill_value=0)
 
-        # Reject unknown branches rather than silently
-        # predicting with an all-zero branch encoding
-        if branch_columns and branch not in available_branches:
-            raise HTTPException(
-                status_code=422,
-                detail={
-                    "message": "Unknown branch",
-                    "provided_branch": data.branch,
-                    "available_branches": sorted(
-                        set(available_branches)
-                    )
-                }
-            )
+        # Prediction
+        prediction = model.predict(input_df)[0]
 
-        # Create DataFrame and preserve EXACT training names
-        df_row = pd.DataFrame([row])
+        # Response
+        if int(prediction) == 1:
+            result = "Placed"
+        else:
+            result = "Not Placed"
 
-        df_row = df_row.reindex(
-            columns=columns,
-            fill_value=0
-        )
-
-        # Critical: keep the original model feature names.
-        # Never strip or rename the trained model's columns.
-        if hasattr(model, "feature_names_in_"):
-            expected_features = list(model.feature_names_in_)
-
-            # Verify the saved columns and model agree
-            if columns != expected_features:
-                raise HTTPException(
-                    status_code=500,
-                    detail=(
-                        "columns.joblib does not match the "
-                        "feature names stored in the model. "
-                        "Regenerate columns.joblib from the "
-                        "original training DataFrame."
-                    )
-                )
-
-            df_row = df_row.reindex(
-                columns=expected_features,
-                fill_value=0
-            )
-
-        # Predict
-        prediction = model.predict(df_row)[0]
-
-        # Return prediction
         return {
-            "prediction": (
-                "Placed" if int(prediction) == 1
-                else "Not Placed"
-            )
+            "prediction": result,
+            "input_branch": data.branch
         }
-
-    except HTTPException:
-        raise
 
     except Exception as e:
         raise HTTPException(
             status_code=500,
-            detail=f"Prediction failed: {str(e)}"
+            detail=str(e)
         )
